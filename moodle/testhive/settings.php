@@ -3,9 +3,9 @@
 
 defined('MOODLE_INTERNAL') || die();
 
-if ($hassiteconfig) {
-    $settings = new admin_settingpage('modsettingtesthive', get_string('pluginname', 'mod_testhive'));
-
+// Activity modules already receive an admin page named modsetting<plugin>.
+// Creating that page again makes Site administration report a duplicate node.
+if ($ADMIN->fulltree) {
     $settings->add(new admin_setting_configtext(
         'mod_testhive/api_base_url',
         get_string('setting_api_base_url', 'mod_testhive'),
@@ -20,6 +20,4 @@ if ($hassiteconfig) {
         get_string('setting_api_key_desc', 'mod_testhive'),
         '',
     ));
-
-    $ADMIN->add('modsettings', $settings);
 }

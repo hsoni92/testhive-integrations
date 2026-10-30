@@ -88,9 +88,47 @@ class api_client {
                 $out[] = [
                     'id' => (string) $item['id'],
                     'name' => (string) ($item['name'] ?? $item['id']),
+                    'type' => (string) ($item['type'] ?? ''),
+                    'count' => (int) ($item['count'] ?? 0),
                 ];
             }
         }
         return $out;
+    }
+
+    /**
+     * @param string $id
+     * @return array{id: string, name: string, type: string, count: int}|null
+     */
+    public static function find_questionset(string $id): ?array {
+        foreach (self::list_questionsets() as $item) {
+            if ($item['id'] === $id) {
+                return $item;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Label for a question-set option: name, size, and kind.
+     *
+     * @param array{id: string, name: string, type?: string, count?: int} $item
+     * @return string
+     */
+    public static function questionset_label(array $item): string {
+        $name = (string) ($item['name'] ?? $item['id']);
+        $details = [];
+        if (!empty($item['count'])) {
+            $details[] = get_string('questioncount', 'mod_testhive', (int) $item['count']);
+        }
+        $type = (string) ($item['type'] ?? '');
+        $typekey = 'questionsettype_' . $type;
+        if ($type !== '' && get_string_manager()->string_exists($typekey, 'mod_testhive')) {
+            $details[] = get_string($typekey, 'mod_testhive');
+        }
+        if (count($details) === 0) {
+            return $name;
+        }
+        return $name . ' — ' . implode(', ', $details);
     }
 }

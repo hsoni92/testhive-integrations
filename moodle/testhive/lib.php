@@ -19,9 +19,24 @@ function testhive_supports(string $feature) {
             return true;
         case FEATURE_BACKUP_MOODLE2:
             return true;
+        case FEATURE_COMPLETION_TRACKS_VIEWS:
+            return true;
+        case FEATURE_GROUPS:
+            return true;
+        case FEATURE_MOD_PURPOSE:
+            return MOD_PURPOSE_ASSESSMENT;
         default:
             return null;
     }
+}
+
+/**
+ * Keep the Testhive mark in brand colour instead of the assessment tint.
+ *
+ * @return bool
+ */
+function testhive_is_branded(): bool {
+    return true;
 }
 
 /**
@@ -33,9 +48,12 @@ function testhive_supports(string $feature) {
 function testhive_add_instance(stdClass $data, $mform = null) {
     global $DB;
 
+    $data = testhive_normalize_instance_data($data);
     $data->timemodified = time();
     $id = $DB->insert_record('testhive', $data);
     $instance = $DB->get_record('testhive', ['id' => $id], '*', MUST_EXIST);
+    testhive_grade_item_update($instance);
+    testhive_update_calendar($instance, (int) ($data->coursemodule ?? 0));
     testhive_sync_remote_test($instance);
     return $id;
 }
@@ -48,10 +66,13 @@ function testhive_add_instance(stdClass $data, $mform = null) {
 function testhive_update_instance(stdClass $data, $mform = null) {
     global $DB;
 
+    $data = testhive_normalize_instance_data($data);
     $data->timemodified = time();
     $data->id = $data->instance;
     $DB->update_record('testhive', $data);
     $instance = $DB->get_record('testhive', ['id' => $data->id], '*', MUST_EXIST);
+    testhive_grade_item_update($instance);
+    testhive_update_calendar($instance, (int) ($data->coursemodule ?? 0));
     testhive_sync_remote_test($instance);
     return true;
 }
@@ -62,19 +83,83 @@ function testhive_update_instance(stdClass $data, $mform = null) {
  */
 function testhive_delete_instance($id) {
     global $DB;
+    $instance = $DB->get_record('testhive', ['id' => $id]);
+    if (!$instance) {
+        return false;
+    }
+    if (!empty($instance->testhive_test_id) && api_client::is_configured()) {
+        try {
+            api_client::request('POST', '/v1/tests/' . $instance->testhive_test_id . '/cancel', []);
+        } catch (Throwable $e) {
+            debugging('mod_testhive: cancel test ' . $instance->testhive_test_id . ': ' . $e->getMessage(), DEBUG_NORMAL);
+        }
+    }
+    testhive_grade_item_delete($instance);
+    testhive_delete_calendar($instance);
     $DB->delete_records('testhive', ['id' => $id]);
     return true;
 }
 
 /**
- * Build invitee list from course enrolment.
+ * @param stdClass $data
+ * @return stdClass
+ */
+function testhive_normalize_instance_data(stdClass $data): stdClass {
+    $data->proctorenabled = empty($data->proctorenabled) ? 0 : 1;
+    $data->timebound = empty($data->timebound) ? 0 : 1;
+    $data->sessionduration = isset($data->sessionduration) ? (int) $data->sessionduration : 0;
+    if (!isset($data->instructions)) {
+        $data->instructions = '';
+    }
+    return $data;
+}
+
+/**
+ * Resync every Testhive activity in a course (enrolment/group changes).
  *
  * @param int $courseid
+ */
+function testhive_resync_course_instances(int $courseid): void {
+    global $DB;
+
+    if (!api_client::is_configured()) {
+        return;
+    }
+
+    $instances = $DB->get_records('testhive', ['course' => $courseid]);
+    foreach ($instances as $instance) {
+        try {
+            testhive_sync_remote_test($instance);
+        } catch (Throwable $e) {
+            debugging('mod_testhive: course ' . $courseid . ' instance ' . $instance->id . ': ' . $e->getMessage(), DEBUG_NORMAL);
+        }
+    }
+}
+
+/**
+ * Build invitee list for this activity (respects separate groups).
+ *
+ * @param stdClass $instance
  * @return array<int, array{email: string, externalId: string}>
  */
-function testhive_build_invitees_for_course(int $courseid): array {
-    $context = context_course::instance($courseid);
-    $users = get_enrolled_users($context, 'mod/testhive:view', 0, 'u.id, u.email');
+function testhive_build_invitees(stdClass $instance): array {
+    $cm = get_coursemodule_from_instance('testhive', $instance->id, $instance->course, false, MUST_EXIST);
+    $context = context_module::instance($cm->id);
+    $users = [];
+
+    if ((int) $cm->groupmode === SEPARATEGROUPS) {
+        $groups = groups_get_all_groups((int) $instance->course, 0, (int) $cm->groupingid);
+        foreach ($groups as $group) {
+            foreach (get_enrolled_users($context, 'mod/testhive:attempt', $group->id, 'u.id, u.email') as $user) {
+                $users[$user->id] = $user;
+            }
+        }
+    } else {
+        foreach (get_enrolled_users($context, 'mod/testhive:attempt', 0, 'u.id, u.email') as $user) {
+            $users[$user->id] = $user;
+        }
+    }
+
     $invitees = [];
     foreach ($users as $user) {
         if (empty($user->email)) {
@@ -89,24 +174,24 @@ function testhive_build_invitees_for_course(int $courseid): array {
 }
 
 /**
- * Create or update the remote Testhive test for this activity instance.
- *
  * @param stdClass $instance
+ * @return int
  */
-function testhive_external_ref(stdClass $instance): string {
-    global $CFG;
-    $sitekey = substr(sha1($CFG->wwwroot), 0, 16);
-    return 'moodle:' . $sitekey . ':' . (int) $instance->id;
+function testhive_session_duration_sec(stdClass $instance): int {
+    $duration = (int) ($instance->sessionduration ?? 0);
+    if ($duration > 0) {
+        return $duration;
+    }
+    $window = (int) $instance->timeclose - (int) $instance->timeopen;
+    return max(1, $window);
 }
 
-function testhive_sync_remote_test(stdClass $instance): void {
-    global $DB;
-
-    $invitees = testhive_build_invitees_for_course((int) $instance->course);
-    if (count($invitees) === 0) {
-        return;
-    }
-
+/**
+ * @param stdClass $instance
+ * @param array $invitees
+ * @return array
+ */
+function testhive_build_sync_payload(stdClass $instance, array $invitees): array {
     $payload = [
         'name' => $instance->name,
         'questionset' => $instance->questionset,
@@ -116,8 +201,40 @@ function testhive_sync_remote_test(stdClass $instance): void {
         'externalRef' => testhive_external_ref($instance),
         'notifyInvitees' => false,
         'slotMode' => 'shared_window',
+        'sessionDurationSec' => testhive_session_duration_sec($instance),
+        'proctorEnabled' => !empty($instance->proctorenabled),
+        'timebound' => !empty($instance->timebound),
     ];
+    $instructions = trim((string) ($instance->instructions ?? ''));
+    if ($instructions !== '') {
+        $payload['instructions'] = $instructions;
+    }
+    return $payload;
+}
 
+/**
+ * @param stdClass $instance
+ */
+function testhive_external_ref(stdClass $instance): string {
+    global $CFG;
+    $sitekey = substr(sha1($CFG->wwwroot), 0, 16);
+    return 'moodle:' . $sitekey . ':' . (int) $instance->id;
+}
+
+/**
+ * Create or update the remote Testhive test for this activity instance.
+ *
+ * @param stdClass $instance
+ */
+function testhive_sync_remote_test(stdClass $instance): void {
+    global $DB;
+
+    $invitees = testhive_build_invitees($instance);
+    if (count($invitees) === 0) {
+        return;
+    }
+
+    $payload = testhive_build_sync_payload($instance, $invitees);
     $response = api_client::request('POST', '/v1/tests', $payload);
     $testid = $response['data']['id'] ?? null;
     if (!$testid) {
@@ -142,8 +259,10 @@ function testhive_get_launch_url(stdClass $instance, int $userid): string {
         throw new moodle_exception('error_apirequest', 'mod_testhive', '', 'User has no email address');
     }
 
+    testhive_sync_remote_test($instance);
+    $instance = $DB->get_record('testhive', ['id' => $instance->id], '*', MUST_EXIST);
     if (empty($instance->testhive_test_id)) {
-        testhive_sync_remote_test($instance);
+        throw new moodle_exception('error_apirequest', 'mod_testhive', '', 'Missing test id after sync');
     }
 
     $response = api_client::request('POST', '/v1/tests/' . $instance->testhive_test_id . '/launch', [
@@ -159,12 +278,33 @@ function testhive_get_launch_url(stdClass $instance, int $userid): string {
 
 /**
  * @param stdClass $testhive
+ * @param array $learner
+ * @return float|null
+ */
+function testhive_scale_learner_grade(stdClass $testhive, array $learner): ?float {
+    if (empty($learner['evaluated']) || $learner['score'] === null) {
+        return null;
+    }
+    $grademax = (float) $testhive->grade;
+    if ($grademax <= 0) {
+        return null;
+    }
+    $maxscore = (float) ($learner['maxScore'] ?? 0);
+    $score = (float) $learner['score'];
+    if ($maxscore > 0) {
+        return ($score / $maxscore) * $grademax;
+    }
+    if (isset($learner['percentScore']) && $learner['percentScore'] !== null) {
+        return ((float) $learner['percentScore'] / 100) * $grademax;
+    }
+    return null;
+}
+
+/**
+ * @param stdClass $testhive
  * @param int $userid 0 = all users
  */
 function testhive_update_grades(stdClass $testhive, int $userid = 0): void {
-    global $CFG;
-    require_once($CFG->libdir . '/gradelib.php');
-
     if (empty($testhive->testhive_test_id)) {
         return;
     }
@@ -177,7 +317,8 @@ function testhive_update_grades(stdClass $testhive, int $userid = 0): void {
 
     $grades = [];
     foreach ($learners as $learner) {
-        if (empty($learner['evaluated']) || $learner['score'] === null) {
+        $raw = testhive_scale_learner_grade($testhive, $learner);
+        if ($raw === null) {
             continue;
         }
         $moodleuserid = 0;
@@ -196,7 +337,7 @@ function testhive_update_grades(stdClass $testhive, int $userid = 0): void {
             continue;
         }
         $grades[$moodleuserid] = (object) [
-            'rawgrade' => (float) $learner['score'],
+            'rawgrade' => $raw,
             'datesubmitted' => time(),
         ];
     }
@@ -205,12 +346,243 @@ function testhive_update_grades(stdClass $testhive, int $userid = 0): void {
         return;
     }
 
-    $item = [
-        'itemname' => $testhive->name,
-        'gradetype' => GRADE_TYPE_VALUE,
-        'grademax' => (float) $testhive->grade,
-        'grademin' => 0,
-    ];
+    testhive_grade_item_update($testhive, $grades);
+}
 
-    grade_update('mod/testhive', $testhive->course, 'mod', 'testhive', $testhive->id, 0, $grades, $item);
+/**
+ * @param stdClass $instance
+ * @return array<int, array<string, string>>
+ */
+function testhive_format_results_rows(stdClass $instance): array {
+    if (empty($instance->testhive_test_id)) {
+        return [];
+    }
+
+    $response = api_client::request('GET', '/v1/tests/' . $instance->testhive_test_id . '/results');
+    $learners = $response['data']['learners'] ?? [];
+    if (!is_array($learners)) {
+        return [];
+    }
+
+    $rows = [];
+    foreach ($learners as $learner) {
+        $userid = 0;
+        $name = $learner['email'] ?? '-';
+        if (!empty($learner['externalId'])) {
+            $userid = (int) $learner['externalId'];
+            $user = \core_user::get_user($userid, false);
+            if ($user) {
+                $name = fullname($user);
+            }
+        } else if (!empty($learner['email'])) {
+            $user = \core_user::get_user_by_email($learner['email']);
+            if ($user) {
+                $name = fullname($user);
+            }
+        }
+
+        $score = '-';
+        $scaled = testhive_scale_learner_grade($instance, $learner);
+        if ($scaled !== null) {
+            $score = format_float($scaled, 2);
+        } else if ($learner['score'] !== null) {
+            $score = format_float((float) $learner['score'], 2);
+        }
+
+        $rows[] = [
+            'name' => $name,
+            'submitted' => !empty($learner['submitted']) ? get_string('yes') : get_string('no'),
+            'evaluated' => !empty($learner['evaluated']) ? get_string('yes') : get_string('no'),
+            'score' => $score,
+            'passed' => !empty($learner['passed']) ? get_string('yes') : get_string('no'),
+        ];
+    }
+    return $rows;
+}
+
+/**
+ * Create or update the gradebook item for this activity.
+ *
+ * @param stdClass $instance
+ * @param array|null $grades
+ * @return int
+ */
+function testhive_grade_item_update(stdClass $instance, ?array $grades = null): int {
+    global $CFG;
+    require_once($CFG->libdir . '/gradelib.php');
+
+    if ($grades === null) {
+        $item = [
+            'itemname' => $instance->name,
+            'gradetype' => GRADE_TYPE_VALUE,
+            'grademax' => (float) $instance->grade,
+            'grademin' => 0,
+        ];
+        return grade_update('mod/testhive', (int) $instance->course, 'mod', 'testhive', (int) $instance->id, 0, null, $item);
+    }
+
+    return grade_update(
+        'mod/testhive',
+        (int) $instance->course,
+        'mod',
+        'testhive',
+        (int) $instance->id,
+        0,
+        $grades,
+        null
+    );
+}
+
+/**
+ * @param stdClass $instance
+ * @return int
+ */
+function testhive_grade_item_delete(stdClass $instance): int {
+    global $CFG;
+    require_once($CFG->libdir . '/gradelib.php');
+    return grade_update('mod/testhive', (int) $instance->course, 'mod', 'testhive', (int) $instance->id, 0, null, ['deleted' => 1]);
+}
+
+/**
+ * Dates shown under the activity on the course page.
+ *
+ * @param stdClass $coursemodule
+ * @return cached_cm_info|false
+ */
+function testhive_get_coursemodule_info($coursemodule) {
+    global $DB;
+
+    $instance = $DB->get_record('testhive', ['id' => $coursemodule->instance], 'id, name, intro, introformat, timeopen, timeclose');
+    if (!$instance) {
+        return false;
+    }
+
+    $info = new cached_cm_info();
+    $info->name = $instance->name;
+    if ($coursemodule->showdescription) {
+        $info->content = format_module_intro('testhive', $instance, $coursemodule->id, false);
+    }
+    if ($instance->timeopen) {
+        $info->customdata['timeopen'] = (int) $instance->timeopen;
+    }
+    if ($instance->timeclose) {
+        $info->customdata['timeclose'] = (int) $instance->timeclose;
+    }
+    return $info;
+}
+
+/**
+ * Grey out the chooser entry until a site admin connects Testhive.
+ *
+ * @param \core_course\local\entity\content_item $defaultitem
+ * @param stdClass $user
+ * @param stdClass $course
+ * @return \core_course\local\entity\content_item[]
+ */
+function testhive_get_course_content_items($defaultitem, $user, $course): array {
+    if (api_client::is_configured()) {
+        return [$defaultitem];
+    }
+    $reason = has_capability('moodle/site:config', \context_system::instance(), $user)
+        ? get_string('unconfigured_chooser_admin', 'mod_testhive')
+        : get_string('unconfigured_chooser_user', 'mod_testhive');
+    return [new \core_course\local\entity\content_item(
+        id: $defaultitem->get_id(),
+        name: $defaultitem->get_name(),
+        title: $defaultitem->get_title(),
+        link: $defaultitem->get_link(),
+        icon: $defaultitem->get_icon(),
+        help: $defaultitem->get_help(),
+        archetype: $defaultitem->get_archetype(),
+        componentname: $defaultitem->get_component_name(),
+        purpose: $defaultitem->get_purpose(),
+        branded: $defaultitem->is_branded(),
+        gradable: $defaultitem->is_gradable(),
+        otherpurpose: $defaultitem->get_other_purpose(),
+        summary: $defaultitem->get_summary(),
+        disabled: true,
+        disabledreason: $reason,
+    )];
+}
+
+/**
+ * @param stdClass $instance
+ */
+function testhive_update_calendar(stdClass $instance, int $cmid = 0): void {
+    global $CFG, $DB;
+    require_once($CFG->dirroot . '/calendar/lib.php');
+
+    if ($cmid <= 0) {
+        $cm = get_coursemodule_from_instance('testhive', $instance->id, $instance->course, false, IGNORE_MISSING);
+        $cmid = $cm ? (int) $cm->id : 0;
+    }
+    if ($cmid <= 0) {
+        return;
+    }
+
+    $times = [
+        'open' => (int) $instance->timeopen,
+        'close' => (int) $instance->timeclose,
+    ];
+    foreach ($times as $type => $time) {
+        $params = ['modulename' => 'testhive', 'instance' => $instance->id, 'eventtype' => $type];
+        $existing = $DB->get_record('event', $params);
+        if ($time <= 0) {
+            if ($existing) {
+                calendar_event::load($existing)->delete();
+            }
+            continue;
+        }
+        $event = (object) [
+            'name' => get_string('calendarevent' . $type, 'mod_testhive', $instance->name),
+            'description' => format_module_intro('testhive', $instance, $cmid, false),
+            'format' => FORMAT_HTML,
+            'courseid' => $instance->course,
+            'groupid' => 0,
+            'userid' => 0,
+            'modulename' => 'testhive',
+            'instance' => $instance->id,
+            'eventtype' => $type,
+            'timestart' => $time,
+            'timeduration' => 0,
+            'type' => CALENDAR_EVENT_TYPE_ACTION,
+            'visible' => instance_is_visible('testhive', $instance),
+        ];
+        if ($existing) {
+            $event->id = $existing->id;
+            calendar_event::load($existing)->update($event, false);
+        } else {
+            calendar_event::create($event, false);
+        }
+    }
+}
+
+/**
+ * @param stdClass $instance
+ */
+function testhive_delete_calendar(stdClass $instance): void {
+    global $CFG, $DB;
+    require_once($CFG->dirroot . '/calendar/lib.php');
+    $events = $DB->get_records('event', ['modulename' => 'testhive', 'instance' => $instance->id]);
+    foreach ($events as $event) {
+        calendar_event::load($event)->delete();
+    }
+}
+
+/**
+ * Plain-language label for a Testhive test status.
+ *
+ * @param string $status
+ * @return string
+ */
+function testhive_status_label(string $status): string {
+    $known = ['active', 'upcoming', 'should_start', 'ended', 'cancelled'];
+    $key = str_replace('-', '_', strtolower($status));
+    if (in_array($key, $known, true)) {
+        return get_string('status_' . $key, 'mod_testhive');
+    }
+    if ($status === '' || $status === '-') {
+        return get_string('status_unknown', 'mod_testhive', '-');
+    }
+    return get_string('status_unknown', 'mod_testhive', $status);
 }

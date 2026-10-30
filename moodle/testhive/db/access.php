@@ -14,6 +14,13 @@ $capabilities = [
         ],
         'clonepermissionsfrom' => 'moodle/course:manageactivities',
     ],
+    'mod/testhive:attempt' => [
+        'captype' => 'write',
+        'contextlevel' => CONTEXT_MODULE,
+        'archetypes' => [
+            'student' => CAP_ALLOW,
+        ],
+    ],
     'mod/testhive:view' => [
         'captype' => 'read',
         'contextlevel' => CONTEXT_MODULE,

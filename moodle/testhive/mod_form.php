@@ -9,7 +9,7 @@ use mod_testhive\local\api_client;
 
 class mod_testhive_mod_form extends moodleform_mod {
     protected function definition() {
-        global $CFG;
+        global $OUTPUT;
 
         $mform = $this->_form;
 
@@ -20,32 +20,61 @@ class mod_testhive_mod_form extends moodleform_mod {
         $this->standard_intro_elements();
 
         $options = [];
-        if (api_client::is_configured()) {
+        $loaderror = '';
+        if (!api_client::is_configured()) {
+            $loaderror = get_string('error_apinotconfigured', 'mod_testhive');
+        } else {
             try {
                 foreach (api_client::list_questionsets() as $item) {
-                    $options[$item['id']] = $item['name'];
+                    $options[$item['id']] = api_client::questionset_label($item);
                 }
             } catch (moodle_exception $e) {
-                $options[''] = $e->getMessage();
+                $loaderror = $e->getMessage();
             }
         }
-        if (count($options) === 0) {
-            $options[''] = get_string('error_noquestionsets', 'mod_testhive');
+        if (!empty($this->current->questionset) && !array_key_exists($this->current->questionset, $options)) {
+            $options[$this->current->questionset] = $this->current->questionset;
         }
 
-        $mform->addElement('select', 'questionset', get_string('questionset', 'mod_testhive'), $options);
-        $mform->addHelpButton('questionset', 'questionset', 'mod_testhive');
-        $mform->addRule('questionset', null, 'required', null, 'client');
+        if ($loaderror !== '' && count($options) === 0) {
+            $mform->addElement('static', 'questionsetwarning', get_string('questionset', 'mod_testhive'),
+                $OUTPUT->notification($loaderror, 'warning'));
+        } else if (count($options) === 0) {
+            $mform->addElement('static', 'questionsetwarning', get_string('questionset', 'mod_testhive'),
+                $OUTPUT->notification(get_string('error_noquestionsets', 'mod_testhive'), 'warning'));
+        } else {
+            $mform->addElement('autocomplete', 'questionset', get_string('questionset', 'mod_testhive'), $options, [
+                'noselectionstring' => get_string('questionset_noselection', 'mod_testhive'),
+            ]);
+            $mform->addHelpButton('questionset', 'questionset', 'mod_testhive');
+            $mform->addRule('questionset', null, 'required', null, 'client');
+            if ($loaderror !== '') {
+                $mform->addElement('static', 'questionsetwarning', '', $OUTPUT->notification($loaderror, 'warning'));
+            }
+        }
 
         $mform->addElement('header', 'availabilityhdr', get_string('availability', 'mod_testhive'));
         $mform->addElement('date_time_selector', 'timeopen', get_string('timeopen', 'mod_testhive'));
+        $mform->addHelpButton('timeopen', 'timeopen', 'mod_testhive');
+        $mform->setDefault('timeopen', time());
         $mform->addElement('date_time_selector', 'timeclose', get_string('timeclose', 'mod_testhive'));
-        $mform->addRule('timeclose', null, 'required', null, 'client');
+        $mform->addHelpButton('timeclose', 'timeclose', 'mod_testhive');
+        $mform->setDefault('timeclose', time() + WEEKSECS);
 
-        $mform->addElement('text', 'grade', get_string('grademax', 'grades'), ['size' => '5']);
-        $mform->setType('grade', PARAM_INT);
-        $mform->setDefault('grade', 100);
-        $mform->addRule('grade', null, 'required', null, 'client');
+        $mform->addElement('header', 'testsettingshdr', get_string('testsettings', 'mod_testhive'));
+        $mform->addElement('advcheckbox', 'proctorenabled', get_string('proctorenabled', 'mod_testhive'));
+        $mform->addHelpButton('proctorenabled', 'proctorenabled', 'mod_testhive');
+        $mform->addElement('text', 'sessionduration', get_string('sessionduration', 'mod_testhive'), ['size' => '6']);
+        $mform->setType('sessionduration', PARAM_INT);
+        $mform->setDefault('sessionduration', 0);
+        $mform->addHelpButton('sessionduration', 'sessionduration', 'mod_testhive');
+        $mform->addElement('advcheckbox', 'timebound', get_string('timebound', 'mod_testhive'));
+        $mform->addHelpButton('timebound', 'timebound', 'mod_testhive');
+        $mform->addElement('textarea', 'instructions', get_string('instructions', 'mod_testhive'), ['rows' => 4, 'cols' => 60]);
+        $mform->setType('instructions', PARAM_TEXT);
+        $mform->addHelpButton('instructions', 'instructions', 'mod_testhive');
+
+        $this->standard_grading_coursemodule_elements();
 
         $this->standard_coursemodule_elements();
         $this->add_action_buttons();
@@ -55,9 +84,14 @@ class mod_testhive_mod_form extends moodleform_mod {
         $errors = parent::validation($data, $files);
         if (!api_client::is_configured()) {
             $errors['questionset'] = get_string('error_apinotconfigured', 'mod_testhive');
+        } else if (empty($data['questionset'])) {
+            $errors['questionset'] = get_string('error_noquestionsets', 'mod_testhive');
         }
         if (!empty($data['timeopen']) && !empty($data['timeclose']) && $data['timeclose'] <= $data['timeopen']) {
-            $errors['timeclose'] = get_string('error_apirequest', 'mod_testhive', 'Close time must be after open time');
+            $errors['timeclose'] = get_string('error_timeclose', 'mod_testhive');
+        }
+        if (isset($data['sessionduration']) && (int) $data['sessionduration'] < 0) {
+            $errors['sessionduration'] = get_string('error_sessionduration', 'mod_testhive');
         }
         return $errors;
     }
