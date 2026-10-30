@@ -22,6 +22,7 @@ class provider implements
         $collection->add_external_location_link('testhive_core', [
             'email' => 'privacy:metadata:email',
             'externalid' => 'privacy:metadata:externalid',
+            'questionsetsource' => 'privacy:metadata:questionsetsource',
         ], 'privacy:metadata:mod_testhive');
 
         return $collection;

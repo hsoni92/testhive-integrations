@@ -53,6 +53,17 @@ class mod_testhive_mod_form extends moodleform_mod {
             }
         }
 
+        if (api_client::is_configured() && has_capability('mod/testhive:addinstance', $this->get_context())) {
+            $formcourseid = testhive_mod_form_course_id($this->_course, $this->_cm ?? null, $this->get_context());
+            if ($formcourseid > 0) {
+                $createurl = new moodle_url('/mod/testhive/createquestionset.php', ['courseid' => $formcourseid]);
+                $link = html_writer::link($createurl, get_string('createquestionset_link', 'mod_testhive'),
+                    ['target' => '_blank']);
+                $mform->addElement('static', 'createquestionsetlink', '', $link);
+                $mform->addHelpButton('createquestionsetlink', 'createquestionset_link', 'mod_testhive');
+            }
+        }
+
         $mform->addElement('header', 'availabilityhdr', get_string('availability', 'mod_testhive'));
         $mform->addElement('date_time_selector', 'timeopen', get_string('timeopen', 'mod_testhive'));
         $mform->addHelpButton('timeopen', 'timeopen', 'mod_testhive');

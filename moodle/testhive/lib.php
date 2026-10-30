@@ -54,7 +54,7 @@ function testhive_add_instance(stdClass $data, $mform = null) {
     $instance = $DB->get_record('testhive', ['id' => $id], '*', MUST_EXIST);
     testhive_grade_item_update($instance);
     testhive_update_calendar($instance, (int) ($data->coursemodule ?? 0));
-    testhive_sync_remote_test($instance);
+    testhive_sync_remote_test($instance, (int) ($data->coursemodule ?? 0));
     return $id;
 }
 
@@ -73,7 +73,7 @@ function testhive_update_instance(stdClass $data, $mform = null) {
     $instance = $DB->get_record('testhive', ['id' => $data->id], '*', MUST_EXIST);
     testhive_grade_item_update($instance);
     testhive_update_calendar($instance, (int) ($data->coursemodule ?? 0));
-    testhive_sync_remote_test($instance);
+    testhive_sync_remote_test($instance, (int) ($data->coursemodule ?? 0));
     return true;
 }
 
@@ -137,13 +137,50 @@ function testhive_resync_course_instances(int $courseid): void {
 }
 
 /**
+ * Resolve the course-module row for this activity (add_instance runs before cm.instance is set).
+ *
+ * @param stdClass $instance
+ * @param int $cmid course_modules.id when known (required during add_instance)
+ * @return stdClass|null
+ */
+function testhive_get_module_cm(stdClass $instance, int $cmid = 0): ?stdClass {
+    global $DB;
+
+    if ($cmid > 0) {
+        // During add_instance, cm.instance is not set yet so get_coursemodule_from_id() cannot join the activity table.
+        $record = $DB->get_record_sql(
+            "SELECT cm.*, md.name AS modname
+               FROM {course_modules} cm
+               JOIN {modules} md ON md.id = cm.module
+              WHERE cm.id = :cmid
+                AND cm.course = :courseid
+                AND md.name = :modulename",
+            [
+                'cmid' => $cmid,
+                'courseid' => (int) $instance->course,
+                'modulename' => 'testhive',
+            ],
+            IGNORE_MISSING
+        );
+        return $record ?: null;
+    }
+
+    $cm = get_coursemodule_from_instance('testhive', (int) $instance->id, (int) $instance->course, false, IGNORE_MISSING);
+    return $cm ?: null;
+}
+
+/**
  * Build invitee list for this activity (respects separate groups).
  *
  * @param stdClass $instance
+ * @param int $cmid
  * @return array<int, array{email: string, externalId: string}>
  */
-function testhive_build_invitees(stdClass $instance): array {
-    $cm = get_coursemodule_from_instance('testhive', $instance->id, $instance->course, false, MUST_EXIST);
+function testhive_build_invitees(stdClass $instance, int $cmid = 0): array {
+    $cm = testhive_get_module_cm($instance, $cmid);
+    if (!$cm) {
+        return [];
+    }
     $context = context_module::instance($cm->id);
     $users = [];
 
@@ -225,11 +262,12 @@ function testhive_external_ref(stdClass $instance): string {
  * Create or update the remote Testhive test for this activity instance.
  *
  * @param stdClass $instance
+ * @param int $cmid course_modules.id when known (pass during add_instance)
  */
-function testhive_sync_remote_test(stdClass $instance): void {
+function testhive_sync_remote_test(stdClass $instance, int $cmid = 0): void {
     global $DB;
 
-    $invitees = testhive_build_invitees($instance);
+    $invitees = testhive_build_invitees($instance, $cmid);
     if (count($invitees) === 0) {
         return;
     }
@@ -336,7 +374,9 @@ function testhive_update_grades(stdClass $testhive, int $userid = 0): void {
         if ($userid !== 0 && $userid !== $moodleuserid) {
             continue;
         }
+        // grade_update() ignores a grade unless the array key and userid are the same user id.
         $grades[$moodleuserid] = (object) [
+            'userid' => $moodleuserid,
             'rawgrade' => $raw,
             'datesubmitted' => time(),
         ];
@@ -585,4 +625,181 @@ function testhive_status_label(string $status): string {
         return get_string('status_unknown', 'mod_testhive', '-');
     }
     return get_string('status_unknown', 'mod_testhive', $status);
+}
+
+/** @var string Site-wide wizard mutex cache key */
+const TESTHIVE_WIZARD_MUTEX_KEY = 'active';
+
+/** @var string Lock resource for Core wizard API calls */
+const TESTHIVE_WIZARD_LOCK_RESOURCE = 'mod_testhive_wizard';
+
+/**
+ * @return \core_cache\cache
+ */
+function testhive_wizard_mutex_cache(): \core_cache\cache {
+    return \core_cache\cache::make('mod_testhive', 'wizardmutex');
+}
+
+/**
+ * User id holding the site wizard mutex, or null.
+ *
+ * @return int|null
+ */
+function testhive_wizard_mutex_owner(): ?int {
+    $value = testhive_wizard_mutex_cache()->get(TESTHIVE_WIZARD_MUTEX_KEY);
+    if ($value === false || $value === null) {
+        return null;
+    }
+    return (int) $value;
+}
+
+/**
+ * @param int $userid
+ */
+function testhive_wizard_mutex_acquire(int $userid): void {
+    testhive_wizard_mutex_cache()->set(TESTHIVE_WIZARD_MUTEX_KEY, $userid);
+}
+
+/**
+ */
+function testhive_wizard_mutex_release(): void {
+    testhive_wizard_mutex_cache()->delete(TESTHIVE_WIZARD_MUTEX_KEY);
+}
+
+/**
+ * Run a callback while holding the Moodle lock for wizard API calls.
+ *
+ * @param callable $callback
+ * @return mixed
+ */
+function testhive_wizard_with_lock(callable $callback) {
+    $factory = \core\lock\lock_config::get_lock_factory('mod_testhive');
+    $lock = $factory->get_lock(TESTHIVE_WIZARD_LOCK_RESOURCE, 30, 1800);
+    if (!$lock) {
+        throw new moodle_exception('wizard_inprogress', 'mod_testhive');
+    }
+    try {
+        return $callback();
+    } finally {
+        $lock->release();
+    }
+}
+
+/**
+ * @param int $userid
+ * @throws moodle_exception
+ */
+function testhive_wizard_assert_mutex_owner(int $userid): void {
+    $owner = testhive_wizard_mutex_owner();
+    if ($owner === null) {
+        throw new moodle_exception('wizard_notstarted', 'mod_testhive');
+    }
+    if ($owner !== $userid) {
+        throw new moodle_exception('wizard_inprogress', 'mod_testhive');
+    }
+}
+
+/**
+ * Resolve the course id on the activity add/edit form (global $COURSE is authoritative).
+ *
+ * @param stdClass $course
+ * @param stdClass|null $cm
+ * @param context|null $context
+ * @return int
+ */
+function testhive_mod_form_course_id(stdClass $course, $cm = null, $context = null): int {
+    global $COURSE, $PAGE;
+
+    $fromurl = optional_param('course', 0, PARAM_INT);
+    if ($fromurl > 0) {
+        return $fromurl;
+    }
+    if (!empty($PAGE->course->id)) {
+        return (int) $PAGE->course->id;
+    }
+    if (!empty($COURSE->id)) {
+        return (int) $COURSE->id;
+    }
+    if (!empty($course->id)) {
+        return (int) $course->id;
+    }
+    if ($cm && !empty($cm->course)) {
+        return (int) $cm->course;
+    }
+    if ($context instanceof context && (int) $context->contextlevel === CONTEXT_COURSE) {
+        return (int) $context->instanceid;
+    }
+    return 0;
+}
+
+/**
+ * Strip answers and rubric fields from wizard questions for teacher preview.
+ *
+ * @param array $questions
+ * @return array<int, array{index: int, stem: string, options: string[]}>
+ */
+function testhive_sanitize_wizard_preview_questions(array $questions): array {
+    $out = [];
+    $index = 0;
+    foreach ($questions as $question) {
+        if (!is_array($question)) {
+            continue;
+        }
+        $index++;
+        $stem = trim((string) ($question['question'] ?? ''));
+        $options = [];
+        if (!empty($question['options']) && is_array($question['options'])) {
+            foreach ($question['options'] as $option) {
+                if (is_array($option) && array_key_exists('text', $option)) {
+                    $options[] = trim((string) $option['text']);
+                } else if (is_string($option)) {
+                    $options[] = trim($option);
+                }
+            }
+        }
+        $out[] = [
+            'index' => $index,
+            'stem' => $stem,
+            'options' => array_values(array_filter($options, static function (string $text): bool {
+                return $text !== '';
+            })),
+        ];
+    }
+    return $out;
+}
+
+/**
+ * @param array $questions raw wizard questions from Core state
+ * @return string HTML preview list
+ */
+function testhive_format_wizard_preview_html(array $questions): string {
+    $rows = testhive_sanitize_wizard_preview_questions($questions);
+    if (count($rows) === 0) {
+        return html_writer::div(get_string('createquestionset_preview_empty', 'mod_testhive'), 'text-muted');
+    }
+    $items = [];
+    foreach ($rows as $row) {
+        $title = html_writer::tag('strong', $row['index'] . '. ') . format_string($row['stem']);
+        $body = $title;
+        if (count($row['options']) > 0) {
+            $optionitems = [];
+            foreach ($row['options'] as $optiontext) {
+                $optionitems[] = html_writer::tag('li', format_string($optiontext));
+            }
+            $body .= html_writer::tag('ul', implode('', $optionitems), ['class' => 'mb-0 ms-3 small']);
+        }
+        $items[] = html_writer::tag('li', $body, ['class' => 'mb-2']);
+    }
+    return html_writer::tag('ol', implode('', $items), ['class' => 'testhive-wizard-preview-list mb-0']);
+}
+
+/**
+ * @return int
+ */
+function testhive_wizard_expected_question_count(): int {
+    global $SESSION;
+    if (!empty($SESSION->mod_testhive_wizard->numquestions)) {
+        return max(1, (int) $SESSION->mod_testhive_wizard->numquestions);
+    }
+    return 0;
 }

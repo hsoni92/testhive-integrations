@@ -131,4 +131,58 @@ class api_client {
         }
         return $name . ' — ' . implode(', ', $details);
     }
+
+    /**
+     * Question set types accepted by the Core wizard.
+     *
+     * @return string[]
+     */
+    public static function questionset_type_options(): array {
+        return ['mcq', 'truefalse', 'descriptive', 'assignment'];
+    }
+
+    /**
+     * Queue async question generation (Core wizard).
+     *
+     * @param array $intent numQuestions, answeringMode, optional totalMarks and difficulty
+     * @param array $source kind text|url plus text or url field
+     * @return array decoded API response including jobId in data
+     */
+    public static function wizard_generate(array $intent, array $source): array {
+        return self::request('POST', '/v1/wizard/questionsets/generate', [
+            'intent' => $intent,
+            'source' => $source,
+        ]);
+    }
+
+    /**
+     * Poll wizard generation state for the configured service key.
+     *
+     * @return array|null data payload or null when no state
+     */
+    public static function wizard_get_state(): ?array {
+        $response = self::request('GET', '/v1/wizard/questionsets/state');
+        $data = $response['data'] ?? null;
+        return is_array($data) ? $data : null;
+    }
+
+    /**
+     * Persist wizard state as a question set.
+     *
+     * @param string $name
+     * @return array{id: string, name: string}
+     */
+    public static function wizard_finalize_questionset(string $name): array {
+        $response = self::request('POST', '/v1/wizard/questionsets', [
+            'name' => $name,
+        ]);
+        $data = $response['data'] ?? [];
+        if (empty($data['id'])) {
+            throw new \moodle_exception('error_apirequest', 'mod_testhive', '', 'Missing question set id in API response');
+        }
+        return [
+            'id' => (string) $data['id'],
+            'name' => (string) ($data['name'] ?? $name),
+        ];
+    }
 }

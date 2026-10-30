@@ -20,9 +20,11 @@ Moodle activity module that integrates with **Testhive Core**.
 ## Teacher workflow
 
 1. In the activity chooser, open **Assessment** and add **Testhive assessment**.
-2. Choose a question set (loaded from `GET /v1/questionsets`).
+2. Choose a question set (loaded from `GET /v1/questionsets`), or choose **Create a new question set in Testhive** to generate one from pasted text or a URL (Core wizard APIs).
 3. Set the open and close times and the grade maximum.
 4. Enrolled students open the activity and choose **Start assessment** while the window is open.
+
+After creating a question set in the new tab, reload the activity form so the autocomplete list includes it. Only one wizard generation can run at a time for the site service key.
 
 ## Grade sync
 
