@@ -39,3 +39,7 @@ Learner email and Moodle user id are sent to the configured Testhive host. See `
 ## Support
 
 Open an issue in the [testhive-integrations](https://github.com/hsoni92/testhive-integrations) repository.
+
+## Moodle plugins directory
+
+To publish on [moodle.org/plugins](https://moodle.org/plugins), use the public GitHub repo, the contribution checklist, and the release process described in [docs/INTEGRATIONS.md](../../../docs/INTEGRATIONS.md#moodle-plugins-directory-moodleorgplugins) in the pinnacle monorepo (or the equivalent section in your checkout’s `docs/INTEGRATIONS.md`).
